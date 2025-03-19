@@ -2,28 +2,40 @@
 # vim: set ft=sh: ts=4:
 # source: https://github.com/jirutka/qemu-openrc
 
-VERSION='0.11.1'
+VERSION='0.12.0'
 VM_NAME="${RC_SVCNAME#qemu.}"
 
-: ${user:=qemu}
-: ${group:=qemu}
+: ${user:=root} # We need root, otherwise vfio binding will fail...
+: ${group:=root}
 : ${pidfile:=/run/qemu/${VM_NAME}/qemu.pid}
 : ${logfile:=/var/log/qemu/${VM_NAME}.log}
-: ${start_wait=100}  # milliseconds
-: ${shutdown_timeout:=40}
+: ${start_wait=500}  # milliseconds
+: ${shutdown_timeout:=60}
 
+: ${smbios:=1}
+: ${manufacturer:=QEMU}
+: ${product:=QEMU}
+: ${version:=1.0.0}
+: ${machine:=q35}
 : ${system_type:=x86_64}
 : ${enable_kvm:=yes}
+: ${enable_usb_ehci:=yes}
+: ${enable_usb_tablet:=yes}
+: ${enable_scsi:=no}
+: ${enable_network:=yes}
 : ${cpu_model:=host}
-: ${smp_cpus:=1}
+: ${smp_cpus:=4}
 : ${smp_cpus_max:=$smp_cpus}
-: ${memory:=1G}
+: ${smp_cpus_threads:=1}
+: ${memory:=8G}
 : ${memory_max:=$memory}
-: ${memory_slots:=2}
+: ${memory_slots:=0}
 : ${memory_hugepages:=no}
 : ${rtc_base:=utc}
 : ${vga:=std}
 : ${vnc_listen:=0.0.0.0}
+: ${vnc_display:=0}
+: ${vnc_password:=}
 : ${hugepages_path:=/dev/hugepages}
 : ${monitor_socket:=/run/qemu/${VM_NAME}/monitor.sock}
 : ${extra_args:=}
@@ -46,15 +58,15 @@ command_args="
 	-name $VM_NAME,process=$VM_NAME
 	-nodefaults
 	-no-user-config
+	-machine type=$machine
 	-cpu $cpu_model
+	-smp $smp_cpus,sockets=1,cores=$smp_cpus,threads=$smp_cpus_threads
 	-overcommit mem-lock=off
 	-rtc base=$rtc_base
-	-smp cpus=$smp_cpus,maxcpus=$smp_cpus_max
 	-device virtio-balloon
-	-vga $vga
 	-device virtio-rng-pci
-	-device virtio-scsi-pci,id=scsi
-	-monitor unix:$monitor_socket,server,nowait"
+	-monitor unix:$monitor_socket,server,nowait
+	-vga $vga"
 command_background='yes'
 command_user="$user"
 command_group="$group"
@@ -85,6 +97,13 @@ start_pre() {
 	if yesno "$enable_kvm"; then
 		command_args_push '-enable-kvm'
 	fi
+
+	# SMBIOS option
+	if [ "$smbios" = "1" ]; then
+		command_args_push "-smbios type=$smbios,manufacturer=$manufacturer,product=$product,version=$version"
+	fi
+
+	# Memory args
 	if [ "$memory" = "$memory_max" ]; then
 		memory_slots="0"
 	fi
@@ -93,10 +112,29 @@ start_pre() {
 	if yesno "$memory_hugepages"; then
 		command_args_push "-mem-path $hugepages_path"
 	fi
+
+	# USB Stuff
+	if yesno "$enable_usb_ehci"; then
+		command_args_push '-device usb-ehci,id=usb'
+	fi
+	if yesno "$enable_usb_tablet"; then
+		command_args_push '-device usb-tablet'
+	fi
+
+	# Virtio SCSI Controller or AHCI
+	if yesno "$enable_scsi"; then
+		command_args_push '-device virtio-scsi-pci,id=scsi'
+	else
+		command_args_push '-device ich9-ahci,id=ahci'
+	fi
+
+	# Display/VNC args
 	if [ -n "$vnc_display" ]; then
 		command_args_push "-display vnc=${vnc_listen}:${vnc_display}${vnc_password:+",password"}"
 	fi
-	command_args_push "$(net_args) $(disk_args) $(cdrom_args) $extra_args"
+
+	# Net, disc, optical and virtio args
+	command_args_push "$(net_args) $(disk_args) $(cdrom_args) $(vfio_args) $extra_args"
 
 	if yesno "$EINFO_VERBOSE"; then
 		einfo "Command: $command $(printf '%s ' $command_args)"
@@ -121,15 +159,25 @@ start_post() {
 }
 
 stop() {
-	local count=0
+	local count=5
 	local retval=0
 
 	ebegin "Stopping $name"
 
 	if is_running && qemush 'system_powerdown'; then
-		count="$shutdown_timeout"
+		einfon "Waiting $count seconds for VM to wake up/shutdown "
+		while is_running && [ $count -gt 0 ]; do
+			sleep 1
+			printf '.'
+			count=$(( count - 1 ))
+		done
+		printf '\n'
+	fi
 
-		printf "   Waiting $count seconds for VM shutdown "
+	count="$shutdown_timeout"
+
+	if is_running && qemush 'system_powerdown'; then
+		einfon "Waiting $count seconds for VM finalize shutdown "
 		while is_running && [ $count -gt 0 ]; do
 			sleep 1
 			printf '.'
@@ -140,7 +188,6 @@ stop() {
 
 	if [ $count -eq 0 ]; then
 		ewarn 'Failed to shutdown VM gracefully using ACPI, stopping it with force'
-
 		start-stop-daemon --stop \
 			--quiet --retry 'SIGKILL/5' \
 			--pidfile "$pidfile" --exec "$command"
@@ -153,6 +200,9 @@ stop() {
 stop_post() {
 	[ -S "$monitor_socket" ] && rm -f "$monitor_socket"
 	[ -f "$pidfile" ] && rm -f "$pidfile"
+
+	vfio_args unbind
+
 	return 0
 }
 
@@ -214,15 +264,27 @@ command_args_push() {
 }
 
 disk_args() {
-	local idx opts
+	local idx opts file
 
 	for idx in $(seq 0 9); do
 		# comma-separated key=value pairs; contains trailing comma if not empty
 		opts=$(set | sed -En "s/^disk${idx}_(.*)/\1/p" | tr $'\n' ',')
 
-		if [ -n "$opts" ]; then
-			echo "-drive id=hd${idx},${opts}media=disk,if=none"
-			echo "-device scsi-hd,drive=hd${idx},scsi-id=${idx}"
+		if [ ! -n "$opts" ]; then
+			file=$(getval "disk${idx}")
+			if [ -n "$file" ]; then
+				if yesno "$enable_scsi"; then
+					echo "-drive file=${file},if=virtio,media=disk"
+				else
+					echo "-drive file=${file},if=none,id=ahci-disk${idx},media=disk"
+					echo "-device ide-hd,drive=ahci-disk${idx},bus=ahci.0"
+				fi
+			fi
+		else
+			if [ -n "$opts" ]; then
+				echo "-drive id=hd${idx},${opts}media=disk,if=none"
+				echo "-device scsi-hd,drive=hd${idx},scsi-id=${idx}"
+			fi
 		fi
 	done
 }
@@ -234,8 +296,13 @@ cdrom_args() {
 		file=$(getval "cdrom${idx}_file")
 
 		if [ -n "$file" ]; then
-			echo "-drive id=cdr${idx},media=cdrom,if=none,file='$file',readonly,cache=none"
-			echo "-device ide-cd,drive=cdr${idx}"
+			if yesno "$enable_scsi"; then
+				echo "-drive file='$file',if=none,id=scsi-cd${idx},media=cdrom,readonly,cache=none"
+				echo "-device scsi-cd,drive=scsi-cd${idx}"
+			else
+				echo "-drive file='$file',if=none,id=ahci-cd${idx},media=cdrom,readonly,cache=none"
+				echo "-device ide-cd,drive=ahci-cd${idx},bus=ahci.1"
+			fi
 		fi
 	done
 }
@@ -243,24 +310,49 @@ cdrom_args() {
 net_args() {
 	local idx net_id net_type opts mac dev
 
+	if yesno "$enable_network"; then
+		for idx in $(seq 0 9); do
+			net_id="net${idx}"
+			net_type=$(getval "$net_id")
+
+			if [ "$net_type" = 'bridge' ]; then
+				check_bridge "$(getval ${net_id}_br br0)"
+			fi
+
+			if [ "$net_type" = 'virtio' ]; then
+				check_bridge "br0"
+				echo "-nic bridge,br=br0,model=virtio-net-pci,mac=EE:EE:4E:24:22:B${idx}"
+			else
+				if [ -n "$net_type" ]; then
+					# comma-separated key=value pairs; contains trailing comma if not empty
+					opts=$(set | sed -En "s/^net${idx}_(.*)/\1/p" \
+							| grep -Ev '^(mac|device)=.*$' \
+							| tr $'\n' ',')
+					mac=$(getval ${net_id}_mac "$(gen_macaddr ${VM_NAME}#${idx})")
+					dev=$(getval ${net_id}_device virtio-net-pci)
+
+					echo "-netdev ${net_type},${opts}id=hostnet${idx}"
+					echo "-device ${dev},id=${net_id},netdev=hostnet${idx},mac=${mac}"
+				fi
+			fi
+		done
+	else
+		echo "-nic none"
+	fi
+}
+
+vfio_args() {
+	local idx vfio
+
 	for idx in $(seq 0 9); do
-		net_id="net${idx}"
-		net_type=$(getval "$net_id")
+		vfio=$(getval "vfio${idx}")
 
-		if [ "$net_type" = 'bridge' ]; then
-			check_bridge "$(getval ${net_id}_br br0)"
-		fi
-
-		if [ -n "$net_type" ]; then
-			# comma-separated key=value pairs; contains trailing comma if not empty
-			opts=$(set | sed -En "s/^net${idx}_(.*)/\1/p" \
-					| grep -Ev '^(mac|device)=.*$' \
-					| tr $'\n' ',')
-			mac=$(getval ${net_id}_mac "$(gen_macaddr ${VM_NAME}#${idx})")
-			dev=$(getval ${net_id}_device virtio-net-pci)
-
-			echo "-netdev ${net_type},${opts}id=hostnet${idx}"
-			echo "-device ${dev},id=${net_id},netdev=hostnet${idx},mac=${mac}"
+		if [ -n "$vfio" ]; then
+			if [ "$1" = "unbind" ]; then
+				bind_pci $vfio -u
+			else
+				echo "-device vfio-pci,host=$(bind_pci $vfio)"
+			fi
 		fi
 	done
 }
@@ -299,4 +391,112 @@ getval() {
 	local default="${2:-}"
 
 	eval "printf '%s\n' \"\${$var_name:-$default}\""
+}
+
+bind_pci() {
+    local VD COUNT BDF TARGET_DEV_SYSFS_PATH DEV_SYSFS_PATHS DSP DBDF DPATH CURR_DRIVER IOMMU_GROUP
+
+    local BDF_REGEX="^[[:xdigit:]]{2}:[[:xdigit:]]{2}.[[:xdigit:]]$"
+    local DBDF_REGEX="^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}.[[:xdigit:]]$"
+
+    VD=$1
+    AR=$2
+
+    COUNT=$(lspci -n -d ${VD} 2>/dev/null | wc -l)
+    if [[ $COUNT -eq 0 ]]; then
+        #eerror "Error: Vendor:Device ${VD} not found"
+        exit 1
+    elif [[ $COUNT -gt 1 ]]; then
+        #eerror "Error: Multiple results for Vendor:Device ${VD}, please provide Domain:Bus:Device.Function (dddd:bb:dd.f) as well"
+        exit 2
+    fi
+
+    BDF=$(lspci -n -d ${VD} 2>/dev/null | cut -d " " -f1)
+    if [[ $BDF =~ $BDF_REGEX ]]; then
+        BDF="0000:${BDF}"
+    elif [[ ! $BDF =~ $DBDF_REGEX ]]; then
+        #eerror "Error: Unable to find Domain:Bus:Device.Function for Vendor:Device ${VD}"
+        exit 3
+    fi
+
+    TARGET_DEV_SYSFS_PATH="/sys/bus/pci/devices/$BDF"
+    if [[ ! -d $TARGET_DEV_SYSFS_PATH ]]; then
+        #eerror "Error: Device ${BDF} does not exist, unable to bind device"
+        exit 4
+    fi
+
+    if [[ ! -d "$TARGET_DEV_SYSFS_PATH/iommu/" ]]; then
+        #eerror "Error: No signs of an IOMMU. Check your hardware and/or linux cmdline parameters. Use intel_iommu=on or iommu=pt iommu=1"
+        exit 5
+    fi
+
+    if [[ ! -z $VD ]]; then
+        if [[ $(lspci -n -s ${BDF} -d ${VD} 2>/dev/null | wc -l) -eq 0 ]]; then
+            #eerror "Error: Vendor:Device ${VD} not found at ${BDF}, unable to bind device"
+            exit 6
+        fi
+    fi
+
+    unset DEV_SYSFS_PATHS
+    for DSP in $TARGET_DEV_SYSFS_PATH/iommu_group/devices/*
+    do
+        DBDF=${DSP##*/}
+        if [[ $(( 0x$(setpci -s $DBDF 0e.b) & 0x7f )) -eq 0 ]]; then
+            DEV_SYSFS_PATHS+=( $DSP )
+        fi
+    done
+
+    modprobe -i vfio-pci
+    if [[ $? -ne 0 ]]; then
+        #eerror "Error: Failed to load vfio-pci module!"
+        exit 7
+    fi
+
+    if [ "$AR" = "-u" ]; then
+        for DSP in ${DEV_SYSFS_PATHS[@]}
+        do
+            DPATH="$DSP/driver"
+            DBDF=${DSP##*/}
+
+            echo $DBDF > "$DPATH/unbind"
+        done
+
+        rmmod vfio-pci
+
+        #einfo "Device ${VD} at ${BDF} unbound from vfio-pci"
+    else
+        for DSP in ${DEV_SYSFS_PATHS[@]}
+        do
+            DPATH="$DSP/driver"
+            DBDF=${DSP##*/}
+
+            echo "vfio-pci" > "$DSP/driver_override"
+
+            if [[ -d $DPATH ]]; then
+                CURR_DRIVER=$(readlink $DPATH)
+                CURR_DRIVER=${CURR_DRIVER##*/}
+
+                # Check if device is already bound...
+                if [[ "$CURR_DRIVER" == "vfio-pci" ]]; then
+                    continue
+                else
+                    echo $DBDF > "$DPATH/unbind"
+                fi
+            fi
+
+            echo $DBDF > /sys/bus/pci/drivers_probe
+        done
+
+        # Adjust group ownership
+        IOMMU_GROUP=$(readlink $TARGET_DEV_SYSFS_PATH/iommu_group)
+        IOMMU_GROUP=${IOMMU_GROUP##*/}
+        chown $SUDO_UID:$SUDO_GID "/dev/vfio/$IOMMU_GROUP"
+        if [[ $? -ne 0 ]]; then
+            #eerror "Error: unable to adjust group ownership of /dev/vfio/${IOMMU_GROUP}" 1>&2
+            exit 8
+        fi
+
+		echo $BDF
+        #einfo "Device ${VD} at ${BDF} bound to vfio-pci"
+    fi
 }
